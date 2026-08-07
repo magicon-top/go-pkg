@@ -1,4 +1,4 @@
-module github.com/magicon-top/go/_pkg/pdfcpu
+module github.com/magicon-top/go-_pkg/pdfcpu
 
 go 1.25.0
 
