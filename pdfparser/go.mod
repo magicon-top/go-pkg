@@ -4,7 +4,7 @@ go 1.26.5
 
 require github.com/pdfcpu/pdfcpu v0.13.0
 
-replace github.com/pdfcpu/pdfcpu => github.com/magicon-top/go-pkg/pdfcpu v0.13.0
+//replace github.com/pdfcpu/pdfcpu => github.com/magicon-top/go-pkg/pdfcpu v0.13.0
 
 require (
 	github.com/clipperhouse/uax29/v2 v2.7.0 // indirect
