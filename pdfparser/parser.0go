@@ -1,0 +1,193 @@
+package pdfparser
+import ("bytes"; "fmt"; "math"; "strconv"; "strings"
+	"github.com/pdfcpu/pdfcpu/pkg/api"
+	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/model"
+	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/types"
+)
+//Комментарии все справа. Короткие строки соединяем через ; Секцию import тоже через ; где не github
+//Никаких обилия пустых строк, Разделители перед функциями вида //______
+const pointsToMm = 2.83465
+type BBox struct { 	MinX, MinY, MaxX, MaxY float64; 	HasPoints bool;}
+func (b *BBox) AddPoint(x, y float64) {
+	if !b.HasPoints { b.MinX, b.MaxX, b.MinY, b.MaxY, b.HasPoints = x, x, y, y, true; return }
+	if x < b.MinX { b.MinX = x }; 	if x > b.MaxX { b.MaxX = x }
+	if y < b.MinY { b.MinY = y }; 	if y > b.MaxY { b.MaxY = y }
+}
+// RectResult описывает найденный элемент на странице
+type RectResult struct { 	XMM, YMM, WMM, HMM float64 }
+type OverprintDetails struct { 
+	HasStrokeOP, HasFillOP bool
+	OPMValue               int }
+//________________________________________________________________________________
+// GetPdfBleedsForPage возвращает вылеты под обрез в мм: left, right, top, bottom, принимая PDF в виде байт
+func GetPdfBleedsForPage(pdfData []byte, pageNum int) (left, right, top, bottom float64, err error) {
+	rs := bytes.NewReader(pdfData)
+	ctx, err := api.ReadContext(rs, model.NewDefaultConfiguration())
+	if err != nil { return 0, 0, 0, 0, fmt.Errorf("ошибка открытия PDF из памяти: %w", err) }
+	if err := ctx.EnsurePageCount(); err != nil { return 0, 0, 0, 0, fmt.Errorf("ошибка подсчета страниц: %w", err) }
+	if pageNum < 1 || pageNum > ctx.PageCount { return 0, 0, 0, 0, fmt.Errorf("страница %d не существует (всего страниц: %d)", pageNum, ctx.PageCount) }
+	// Запрашиваем границы конкретной страницы
+	pageBoundaries, err := ctx.PageBoundaries(types.IntSet{pageNum: true})
+	if err != nil { return 0, 0, 0, 0, fmt.Errorf("ошибка при получении границ: %w", err) }
+	// Извлекаем границы
+	var pageBounds model.PageBoundaries
+	for _, bounds := range pageBoundaries { pageBounds = bounds; break }
+	tb, bb := pageBounds.TrimBox(), pageBounds.BleedBox()
+	// Если BleedBox не задан явно — берем MediaBox в качестве внешнего контейнера
+	if bb == nil { bb = pageBounds.MediaBox() }
+	if tb == nil || bb == nil { return 0, 0, 0, 0, fmt.Errorf("в PDF отсутствуют необходимые метки (TrimBox или Bleed/MediaBox)") }
+	// Расчет вылетов для каждой стороны в мм
+	left = (tb.LL.X - bb.LL.X) / pointsToMm; 	right = (bb.UR.X - tb.UR.X) / pointsToMm
+	top = (bb.UR.Y - tb.UR.Y) / pointsToMm;  	bottom = (tb.LL.Y - bb.LL.Y) / pointsToMm
+	return left, right, top, bottom, nil
+}
+//________________________________________________________________________________
+// FindLowestLeftQurve3 читает PDF из памяти и  находит самый левый нижний объект с указанной заливкой и обводкой, возвращает координаты левого нижнего угла и расстояние между ближайшими обьектами по x,y.
+func FindLowestLeftQurve3(pdfData []byte, targetPage int, fillFilter, strokeFilter string) (xMM, yMM, widthCalc, heightCalc float64, found bool, err error) {
+	results, err := FindQurveByColors(pdfData, targetPage, fillFilter, strokeFilter)
+	if err != nil || len(results) == 0 { return 0, 0, 0, 0, false, err }	
+	lowestLeftItem := results[0] // Находим самый левый нижний объект
+	for _, item := range results { if item.XMM < lowestLeftItem.XMM || (item.XMM == lowestLeftItem.XMM && item.YMM < lowestLeftItem.YMM) { lowestLeftItem = item } 
+	}
+	xMM, yMM = lowestLeftItem.XMM, lowestLeftItem.YMM
+	hasRight, hasAbove := false, false
+	minRightX, minAboveY := math.MaxFloat64, math.MaxFloat64
+	eps := 0.001
+	for _, item := range results {		
+		if math.Abs(item.XMM-xMM) < eps && math.Abs(item.YMM-yMM) < eps { continue } // Исключаем сам базовый объект		
+		if item.XMM > xMM && item.XMM < minRightX { minRightX, hasRight = item.XMM, true } // Ищем ближайший объект правее		
+		if item.YMM > yMM && item.YMM < minAboveY { minAboveY, hasAbove = item.YMM, true } // Ищем ближайший объект выше
+	}	
+	if hasRight { widthCalc = minRightX - xMM } else { widthCalc = lowestLeftItem.WMM } // Если справа ничего нет — берем ширину нашего объекта	
+	if hasAbove { heightCalc = minAboveY - yMM } else { heightCalc = lowestLeftItem.HMM } // Если выше ничего нет — берем высоту нашего объекта
+	return xMM, yMM, widthCalc, heightCalc, true, nil
+}
+//________________________________________________________________________________
+// FindLowestLeftQurve читает PDF из памяти и  находит самый левый нижний объект с указанной заливкой и обводкой, возвращает координаты левого нижнего угла и ширину высоту обьекта.
+func FindLowestLeftQurve(pdfData []byte, targetPage int, fillFilter, strokeFilter string) (xMM, yMM, wMM, hMM float64, found bool, err error) {
+	results, err := FindQurveByColors(pdfData, targetPage, fillFilter, strokeFilter)
+	if err != nil || len(results) == 0 { return 0, 0, 0, 0, false, err }
+	lowestLeftItem := results[0]
+	for _, item := range results { if item.XMM < lowestLeftItem.XMM || (item.XMM == lowestLeftItem.XMM && item.YMM < lowestLeftItem.YMM) { lowestLeftItem = item } 	}
+	return lowestLeftItem.XMM, lowestLeftItem.YMM, lowestLeftItem.WMM, lowestLeftItem.HMM, true, nil
+}
+//________________________________________________________________________________
+// FindQurveByColors читает PDF из памяти и находит все кривые с указанной заливкой и обводкой, а возвращает координаты  левого нижнего угла и ширину и высоту
+func FindQurveByColors(pdfData []byte, targetPage int, fillFilter, strokeFilter string) ([]RectResult, error) {
+	rs := bytes.NewReader(pdfData)
+	ctx, err := api.ReadContext(rs, model.NewDefaultConfiguration())
+	if err != nil { return nil, fmt.Errorf("ошибка чтения PDF из памяти: %v", err) }
+	// Инициализируем страницы, чтобы pdfcpu корректно построил внутреннее дерево
+	if err := ctx.EnsurePageCount(); err != nil { return nil, fmt.Errorf("ошибка инициализации страниц: %v", err) }
+	pageDict, _, _, err := ctx.PageDict(targetPage, false)
+	if err != nil { return nil, fmt.Errorf("ошибка получения словаря страницы: %v", err) }
+	contentStream, err := ctx.PageContent(pageDict, targetPage)
+	if err != nil { return nil, fmt.Errorf("ошибка контента страницы: %v", err) }
+	overprintStates := make(map[string]OverprintDetails)
+	if resDict := pageDict.DictEntry("Resources"); resDict != nil {
+		if gsDict := resDict.DictEntry("ExtGState"); gsDict != nil {
+			for gsName, gsObj := range gsDict {
+				var subDict types.Dict
+				if d, ok := gsObj.(types.Dict); ok { subDict = d } else if indRef, ok := gsObj.(types.IndirectRef); ok {
+					if derefObj, err := ctx.Dereference(indRef); err == nil {
+						if d, ok := derefObj.(types.Dict); ok { subDict = d }
+					}
+				}
+
+				if subDict != nil { details := OverprintDetails{}
+					if opObj, ok := subDict["OP"]; ok { if b, isBool := opObj.(types.Boolean); isBool && bool(b) { details.HasStrokeOP = true } }
+					if opObj, ok := subDict["op"]; ok { if b, isBool := opObj.(types.Boolean); isBool && bool(b) { details.HasFillOP = true } }
+					if opmObj, ok := subDict["OPM"]; ok { if i, isInt := opmObj.(types.Integer); isInt { details.OPMValue = int(i) } }
+					overprintStates["/"+gsName] = details
+				}
+			}
+		}
+	}
+
+	tokens := strings.Fields(string(contentStream))
+	var stack []string
+	var currentBBox BBox
+	var results []RectResult
+
+	var currStrokeC, currStrokeM, currStrokeY, currStrokeK float64
+	var currFillC, currFillM, currFillY, currFillK float64
+	var gsStrokeOP, gsFillOP, opOpStroke, opOpFill bool
+	var gsOPM int
+
+	const ptToMM = 0.352778
+
+	for _, token := range tokens {
+		switch token {	case "gs":
+			if len(stack) >= 1 {
+				if details, ok := overprintStates[stack[len(stack)-1]]; ok { gsStrokeOP, gsFillOP, gsOPM = details.HasStrokeOP, details.HasFillOP, details.OPMValue }
+			}
+			stack = nil
+
+		case "OP": if len(stack) >= 1 { opOpStroke = (stack[len(stack)-1] == "true") }; stack = nil
+		case "op": if len(stack) >= 1 { opOpFill = (stack[len(stack)-1] == "true") }; stack = nil
+		case "K":  if len(stack) >= 4 { currStrokeC, currStrokeM, currStrokeY, currStrokeK = parseNum(stack[len(stack)-4]), parseNum(stack[len(stack)-3]), parseNum(stack[len(stack)-2]), parseNum(stack[len(stack)-1]) }; 	stack = nil
+		case "SC", "SCN":
+			if len(stack) >= 4 {
+				currStrokeC, currStrokeM, currStrokeY, currStrokeK = parseNum(stack[len(stack)-4]), parseNum(stack[len(stack)-3]), parseNum(stack[len(stack)-2]), parseNum(stack[len(stack)-1])
+			} else if len(stack) >= 1 && parseNum(stack[len(stack)-1]) == 0 {
+				currStrokeC, currStrokeM, currStrokeY, currStrokeK = 0, 0, 0, 0 }; 			stack = nil
+
+		case "k": if len(stack) >= 4 { currFillC, currFillM, currFillY, currFillK = parseNum(stack[len(stack)-4]), parseNum(stack[len(stack)-3]), parseNum(stack[len(stack)-2]), parseNum(stack[len(stack)-1]) }
+			stack = nil
+
+		case "sc", "scn":
+			if len(stack) >= 4 {
+				currFillC, currFillM, currFillY, currFillK = parseNum(stack[len(stack)-4]), parseNum(stack[len(stack)-3]), parseNum(stack[len(stack)-2]), parseNum(stack[len(stack)-1])
+			} else if len(stack) >= 1 && parseNum(stack[len(stack)-1]) == 0 {
+				currFillC, currFillM, currFillY, currFillK = 0, 0, 0, 0 	}
+			stack = nil
+
+		case "G": if len(stack) >= 1 { currStrokeC, currStrokeM, currStrokeY, currStrokeK = 0, 0, 0, 1.0-parseNum(stack[len(stack)-1]) }; stack = nil
+		case "g":	if len(stack) >= 1 { currFillC, currFillM, currFillY, currFillK = 0, 0, 0, 1.0-parseNum(stack[len(stack)-1]) }; stack = nil
+		case "re": 
+			if len(stack) >= 4 {
+				x, y, w, h := parseNum(stack[len(stack)-4]), parseNum(stack[len(stack)-3]), parseNum(stack[len(stack)-2]), parseNum(stack[len(stack)-1])
+				currentBBox = BBox{}
+				currentBBox.AddPoint(x, y)
+				currentBBox.AddPoint(x+w, y+h) 	}; 			stack = nil
+
+		case "m", "l", "v", "y": 	if len(stack) >= 2 { currentBBox.AddPoint(parseNum(stack[len(stack)-2]), parseNum(stack[len(stack)-1])) }; 		stack = nil
+		case "c": if len(stack) >= 6 { currentBBox.AddPoint(parseNum(stack[len(stack)-2]), parseNum(stack[len(stack)-1])) };		stack = nil
+		case "S", "s", "f", "F", "B", "B*", "b", "b*":
+			if currentBBox.HasPoints {
+				isStroke := (token == "S" || token == "s" || token == "B" || token == "B*" || token == "b" || token == "b*")
+				isFill := (token == "f" || token == "F" || token == "B" || token == "B*" || token == "b" || token == "b*")
+				fillMatched := matchColor(fillFilter, isFill, currFillC, currFillM, currFillY, currFillK, opOpFill || gsFillOP)
+				strokeMatched := matchColor(strokeFilter, isStroke, currStrokeC, currStrokeM, currStrokeY, currStrokeK, opOpStroke || gsStrokeOP || gsOPM > 0)
+				if fillMatched && strokeMatched {
+					results = append(results, RectResult{
+						XMM: currentBBox.MinX * ptToMM, YMM: currentBBox.MinY * ptToMM,
+						WMM: (currentBBox.MaxX - currentBBox.MinX) * ptToMM, HMM: (currentBBox.MaxY - currentBBox.MinY) * ptToMM,
+					})
+				}
+			}
+			currentBBox, stack = BBox{}, nil
+
+		case "n":	currentBBox, stack = BBox{}, nil
+		default: 	stack = append(stack, token)
+		}
+	}
+
+	return results, nil
+}
+//________________________________________________________________________________
+func matchColor(filter string, isActive bool, c, m, y, k float64, opActive bool) bool {
+	if filter == "*" { return true }
+	if filter == "" { return !isActive }
+	if !isActive { return false }
+	parts := strings.Split(filter, "-")
+	if len(parts) < 4 { return false }
+
+	fc, fm, fy, fk := parseNum(parts[0]), parseNum(parts[1]), parseNum(parts[2]), parseNum(parts[3])
+	if fc > 1 || fm > 1 || fy > 1 || fk > 1 { fc, fm, fy, fk = fc/100, fm/100, fy/100, fk/100 }
+	eps := 0.01
+	if math.Abs(c-fc) > eps || math.Abs(m-fm) > eps || math.Abs(y-fy) > eps || math.Abs(k-fk) > eps { return false }
+	return (len(parts) == 5 && parts[4] == "o") == opActive
+}
+
+func parseNum(s string) float64 { val, _ := strconv.ParseFloat(s, 64);  return val }
